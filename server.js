@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 'use strict';
- 
+
 /**
  * Extrator de dados de nota fiscal de serviço (PDF).
  *
  * INSTALAÇÃO (Node.js 18+):
  *   npm init -y
  *   npm install pdf-parse@1.1.1
- *   # Necessário para ler a OS (foto/PDF escaneado) via OCR:
+ *   # Necessário para ler PDFs que são imagem (nota, boleto e OS escaneados):
  *   npm install tesseract.js pdf-to-img
  *
  * USO:
@@ -15,22 +15,22 @@
  *                                           nota fiscal, boleto e OS)
  *   node index.js nota.pdf boleto.pdf os.pdf   (arquivos específicos)
  */
- 
+
 const fs = require('fs');
 const path = require('path');
- 
+
 const NAO_ENCONTRADO = 'Não encontrado';
- 
+
 /* ------------------------------------------------------------------ */
 /* Utilitários                                                         */
 /* ------------------------------------------------------------------ */
- 
+
 /** Valida os dígitos verificadores de um CNPJ. */
 function validarCnpj(cnpj) {
   const d = cnpj.replace(/\D/g, '');
   // Precisa ter 14 dígitos e não pode ser sequência repetida (ex.: 000...0)
   if (d.length !== 14 || /^(\d)\1{13}$/.test(d)) return false;
- 
+
   const calcularDigito = (base) => {
     const pesos =
       base.length === 12
@@ -42,42 +42,42 @@ function validarCnpj(cnpj) {
     const resto = soma % 11;
     return resto < 2 ? 0 : 11 - resto;
   };
- 
+
   const d1 = calcularDigito(d.slice(0, 12));
   const d2 = calcularDigito(d.slice(0, 12) + d1);
   return d1 === Number(d[12]) && d2 === Number(d[13]);
 }
- 
+
 /** Formata 14 dígitos como 00.000.000/0000-00. */
 function formatarCnpj(cnpj) {
   return cnpj
     .replace(/\D/g, '')
     .replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5');
 }
- 
+
 /** Converte "1.234,56" em 1234.56. */
 function paraNumero(valorBr) {
   return Number(valorBr.replace(/\./g, '').replace(',', '.'));
 }
- 
+
 /** Formata número como "R$ 1.234,56". */
 function formatarMoeda(numero) {
   return numero
     .toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })
     .replace(/\u00a0/g, ' ');
 }
- 
+
 /** Posição da última ocorrência de uma regex (com flag g) em um texto. */
 function ultimaPosicao(regex, texto) {
   let pos = -1;
   for (const m of texto.matchAll(regex)) pos = m.index;
   return pos;
 }
- 
+
 /* ------------------------------------------------------------------ */
 /* Leitura do PDF                                                      */
 /* ------------------------------------------------------------------ */
- 
+
 /** Extrai o texto de um PDF com camada de texto. */
 async function extrairTextoPdf(buffer) {
   // Importa direto do arquivo da lib para evitar o modo debug do pdf-parse
@@ -85,7 +85,7 @@ async function extrairTextoPdf(buffer) {
   const resultado = await pdfParse(buffer);
   return resultado.text || '';
 }
- 
+
 /** Fallback: OCR para PDFs escaneados (requer tesseract.js e pdf-to-img). */
 async function extrairTextoComOcr(caminho) {
   let pdfParaImagens;
@@ -99,7 +99,7 @@ async function extrairTextoComOcr(caminho) {
         'Rode: npm install tesseract.js pdf-to-img'
     );
   }
- 
+
   const worker = await Tesseract.createWorker('por');
   try {
     let texto = '';
@@ -113,16 +113,43 @@ async function extrairTextoComOcr(caminho) {
     await worker.terminate();
   }
 }
- 
+
+/**
+ * Diz se o texto lido da camada de texto do PDF é confiável.
+ *
+ * Scanners (ex.: "IJ Scan Utility") costumam embutir uma camada de texto
+ * gerada por um OCR ruim, cheia de lixo ("ffi§tue@Nffi"). Esse texto passa
+ * de 50 caracteres, então antes ele era aceito e o OCR nunca rodava.
+ * Aqui: se o PDF tem imagem e o texto tem muitos símbolos estranhos ou
+ * poucas palavras reais, o texto é considerado lixo e o OCR é usado.
+ */
+function textoConfiavel(texto, buffer) {
+  const t = texto.replace(/\s+/g, ' ').trim();
+  if (t.length < 50) return false;
+
+  const temImagem = /\/Subtype\s*\/Image/.test(buffer.toString('latin1'));
+  if (!temImagem) return true; // PDF digital sem imagem: confia no texto
+
+  const tokens = t.split(' ');
+  const simbolos = (t.match(/[§@{}\[\]|\\^~`´¨_<>]/g) || []).length;
+  const palavrasBoas = tokens.filter(
+    (w) => /^[A-Za-zÀ-ÿ]{3,}[.,:;]?$/.test(w) && /[aeiouáéíóúâêôãõ]/i.test(w)
+  ).length;
+
+  const proporcaoSimbolos = simbolos / t.replace(/ /g, '').length;
+  const proporcaoBoas = palavrasBoas / tokens.length;
+  return proporcaoSimbolos < 0.01 && proporcaoBoas >= 0.5;
+}
+
 /* ------------------------------------------------------------------ */
 /* Extração dos campos                                                 */
 /* ------------------------------------------------------------------ */
- 
+
 // Rótulos que indicam a qual empresa pertence um CNPJ.
 // Prestador = quem presta o serviço; Tomador = quem contrata (emissor do chamado).
 const ROTULOS_PRESTADOR = /prestador|emitente|fornecedor/gi;
 const ROTULOS_TOMADOR = /tomador|contratante|cliente|destinat[aá]rio/gi;
- 
+
 /**
  * Localiza todos os CNPJs válidos e tenta classificá-los em
  * prestador / tomador pelo rótulo mais próximo antes de cada um.
@@ -130,34 +157,34 @@ const ROTULOS_TOMADOR = /tomador|contratante|cliente|destinat[aá]rio/gi;
 function extrairCnpjs(texto) {
   const avisos = [];
   const todos = [];
- 
+
   // 00.000.000/0000-00 ou 14 dígitos corridos; (?<!\d) e (?!\d) evitam
   // pegar pedaços de números maiores (ex.: chave de acesso de 44 dígitos)
   const regexCnpj = /(?<!\d)\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}(?!\d)/g;
- 
+
   let fimAnterior = 0;
   for (const m of texto.matchAll(regexCnpj)) {
     if (!validarCnpj(m[0])) continue;
     const cnpj = formatarCnpj(m[0]);
- 
+
     // Janela de até 250 caracteres antes do CNPJ, sem passar do CNPJ anterior
     const inicio = Math.max(fimAnterior, m.index - 250);
     const janela = texto.slice(inicio, m.index);
     const posPrestador = ultimaPosicao(ROTULOS_PRESTADOR, janela);
     const posTomador = ultimaPosicao(ROTULOS_TOMADOR, janela);
- 
+
     let papel = null;
     if (posPrestador > posTomador) papel = 'prestador';
     else if (posTomador > posPrestador) papel = 'tomador';
- 
+
     // Ignora CNPJs repetidos (o mesmo CNPJ pode aparecer várias vezes)
     if (!todos.some((c) => c.cnpj === cnpj)) todos.push({ cnpj, papel });
     fimAnterior = m.index + m[0].length;
   }
- 
+
   let prestador = todos.find((c) => c.papel === 'prestador')?.cnpj ?? null;
   let tomador = todos.find((c) => c.papel === 'tomador')?.cnpj ?? null;
- 
+
   // Se só um foi identificado e há exatamente dois CNPJs, o outro é o restante
   if (todos.length === 2 && (!prestador || !tomador) && (prestador || tomador)) {
     const outro = todos.find((c) => c.cnpj !== (prestador || tomador)).cnpj;
@@ -165,36 +192,49 @@ function extrairCnpjs(texto) {
     else tomador = outro;
     avisos.push('Um dos CNPJs foi deduzido por exclusão. Confira o resultado.');
   }
- 
+
   if (!prestador && !tomador && todos.length > 0) {
     avisos.push(
       'Não foi possível diferenciar prestador e tomador. CNPJs encontrados: ' +
         todos.map((c) => c.cnpj).join(', ')
     );
   }
- 
+
   return { prestador, tomador, avisos };
 }
- 
+
+// Valor monetário no padrão brasileiro: 1.234,56 (com ou sem "R$" antes)
+const VALOR_BR = '(?:R\\$\\s*|RS\\s*)?(\\d{1,3}(?:\\.\\d{3})*,\\d{2})(?!\\d)';
+
 /**
- * Procura um valor monetário logo depois de um dos rótulos, em ordem
- * de prioridade (do mais específico ao mais genérico).
+ * Procura um valor monetário depois de um dos rótulos, em ordem de
+ * prioridade (do mais específico ao mais genérico). Para cada rótulo
+ * tenta dois jeitos:
+ *
+ *  1. Valor logo depois do rótulo:      "Valor bruto: R$ 1.000,00"
+ *  2. Rótulo é cabeçalho de uma tabela: a linha de títulos vem primeiro e
+ *     os valores só aparecem na linha de baixo, depois de vários outros
+ *     títulos. Ex. (NFSe Campinas):
+ *        Valor total da NFSe (R$)  Total das deduções (R$)  Base de cálculo...
+ *        R$ 778,06                 R$ 0,00                  R$ 778,06
+ *     Como o rótulo é a 1ª coluna, o 1º valor depois dele é o dele.
  */
 function buscarValor(texto, rotulos) {
   for (const rotulo of rotulos) {
-    // rótulo + até 60 caracteres não numéricos + (R$) + número no padrão 1.234,56
-    const regex = new RegExp(
-      `${rotulo}[^\\d]{0,60}?(?:R\\$\\s*)?(\\d{1,3}(?:\\.\\d{3})*,\\d{2})`,
-      'i'
-    );
-    const m = texto.match(regex);
+    const perto = new RegExp(`${rotulo}[^\\d]{0,60}?${VALOR_BR}`, 'i');
+    let m = texto.match(perto);
+    if (m) return paraNumero(m[1]);
+
+    const tabela = new RegExp(`${rotulo}[\\s\\S]{0,500}?${VALOR_BR}`, 'i');
+    m = texto.match(tabela);
     if (m) return paraNumero(m[1]);
   }
   return null;
 }
- 
+
 function extrairValorBruto(texto) {
   return buscarValor(texto, [
+    'valor\\s+total\\s+da\\s+nfs-?e(?:\\s+\\w+)?', // "Valor total da NFSe Campinas"
     'valor\\s+bruto',
     'valor\\s+total\\s+dos\\s+servi[cç]os',
     'valor\\s+dos\\s+servi[cç]os',
@@ -202,45 +242,71 @@ function extrairValorBruto(texto) {
     'valor\\s+total',
   ]);
 }
- 
+
 function extrairValorLiquido(texto) {
-  // "Valor Líquido", "Valor Líquido da Nota", "Valor Líquido da NFS-e"
+  // "Valor Líquido", "Valor Líquido da Nota", "Valor Líquido da NFSe Campinas"
   return buscarValor(texto, ['valor\\s+l[ií]quido']);
 }
- 
+
+/** Valor do boleto ("(=) Valor do documento"), usado para conferência. */
+function extrairValorBoleto(texto) {
+  return buscarValor(texto, ['valor\\s+do\\s+documento']);
+}
+
 function extrairDescricao(texto) {
-  // Rótulos que iniciam a descrição
+  // Rótulos que iniciam a descrição. No modelo de Campinas o título é seguido
+  // de uma explicação entre parênteses, que é ignorada.
   const inicio =
-    '(?:discrimina[cç][aã]o\\s+(?:dos\\s+)?servi[cç]os?|descri[cç][aã]o\\s+(?:dos?\\s+)?servi[cç]os?|discrimina[cç][aã]o)';
+    '(?:discrimina[cç][aã]o\\s+(?:dos\\s+)?servi[cç]os?|descri[cçg][aã]o\\s+(?:dos?\\s+)?servi[cç]os?(?:\\s+prestado)?|discrimina[cç][aã]o)' +
+    '\\s*(?:\\([^)]*\\))?';
   // Início de linha que marca o próximo campo/seção (fim da descrição)
   const fim =
-    '(?:valor|base\\s+de\\s+c[aá]lculo|dedu[cç][õo]es|c[oó]digo\\s+d[oa]|tributa|iss|reten[cç]|outras\\s+informa|informa[cç][õo]es\\s+complementares|pis|cofins|inss|irrf|csll)';
- 
+    '(?:valor|base\\s+de\\s+c[aá]lculo|dedu[cç][õo]es|c[oó]digo\\s+d[oa]|tributa|iss|reten[cç]|outras\\s+informa|informa[cç][õo]es\\s+complementares|pis|cofins|inss|irrf|csll|documento\\s+emitido)';
+
   const regex = new RegExp(
     `${inicio}\\s*:?\\s*([\\s\\S]+?)(?=\\n\\s*${fim}|$)`,
     'i'
   );
   const m = texto.match(regex);
   if (!m) return null;
- 
+
   const descricao = m[1].replace(/\s+/g, ' ').trim();
   if (!descricao) return null;
   return descricao.length > 1000 ? descricao.slice(0, 1000) + '…' : descricao;
 }
- 
+
 /**
- * Procura o número da nota depois de rótulos como "Número da Nota",
- * "Número da NFS-e" ou "Nota Fiscal nº". Aceita formatos como 12345
- * ou 2026/123 (ano/número).
+ * Número da nota. Cobre dois formatos:
+ *
+ *  a) Valor logo depois do rótulo: "Número da Nota: 12345", "NFS-e nº 2026/123"
+ *  b) Cabeçalho de tabela (NFSe Campinas): os títulos vêm numa linha e os
+ *     valores na de baixo:
+ *        Data e hora de emissão   Competência   Número / Série
+ *        06/10/2026 13:52:00      10/2026       9847 / E
+ *     Aqui, depois de tirar datas, horas e a competência (mm/aaaa), o
+ *     primeiro número que sobra é o da nota.
  */
 function extrairNumeroNota(texto) {
+  // (b) "Número / Série" (o OCR às vezes perde o acento: "Numero / Serie")
+  const cab = /n[úu]mero\s*\/\s*s[ée]rie/i.exec(texto);
+  if (cab) {
+    const trecho = texto
+      .slice(cab.index + cab[0].length, cab.index + cab[0].length + 200)
+      .replace(/\d{2}[/.-]\d{2}[/.-]\d{4}/g, ' ') // datas dd/mm/aaaa
+      .replace(/\d{1,2}:\d{2}(?::\d{2})?/g, ' ') // horas
+      .replace(/(?<!\d)\d{2}\/\d{4}(?!\d)/g, ' '); // competência mm/aaaa
+    const n = trecho.match(/(?<![\d/.-])(\d{1,15})(?![\d.])/);
+    if (n) return n[1];
+  }
+
+  // (a) rótulo seguido do número
   const rotulos = [
     'n[úu]mero\\s+da\\s+nota(?:\\s+fiscal)?',
     'n[úu]mero\\s+da\\s+nfs-?e',
     'nfs-?e\\s*(?:n[º°o.]|n[úu]mero)',
     'nota\\s+fiscal(?:\\s+de\\s+servi[cç]os?)?(?:\\s+eletr[ôo]nica)?\\s*(?:n[º°o.]|n[úu]mero)',
   ];
- 
+
   for (const rotulo of rotulos) {
     // rótulo + até 30 caracteres não numéricos + número (com / . - opcional no meio)
     const regex = new RegExp(`${rotulo}[^\\d]{0,30}?(\\d{1,15}(?:[./-]\\d{1,10})?)`, 'i');
@@ -249,17 +315,28 @@ function extrairNumeroNota(texto) {
   }
   return null;
 }
- 
+
+/** Número do documento no boleto ("Nº do documento"), usado como alternativa. */
+function extrairNumeroBoleto(texto) {
+  // A linha de títulos vem antes: "Data do Doc.  Nº do documento ..."
+  // e a de valores depois: "07/10/2026  9847  DM  N  07/10/2026"
+  const m = texto.match(
+    /data\s+do\s+doc[\s\S]{0,150}?(?<!\d)\d{2}[/.-]\d{2}[/.-]\d{4}\s+(\d{1,15})(?!\d)/i
+  );
+  return m ? m[1] : null;
+}
+
 /**
  * Procura uma data no formato dd/mm/aaaa (também aceita - ou . como
- * separador) logo depois de um dos rótulos, testados em ordem.
+ * separador) depois de um dos rótulos, testados em ordem. A janela é
+ * larga porque, em tabelas, outros títulos ficam entre o rótulo e a data.
  * Se houver hora junto (ex.: 24/10/2026 14:30), só a data é retornada.
  */
 function buscarData(texto, rotulos) {
   for (const rotulo of rotulos) {
-    // rótulo + até 40 caracteres não numéricos + data dd/mm/aaaa
+    // rótulo + até 100 caracteres não numéricos + data dd/mm/aaaa
     const regex = new RegExp(
-      `${rotulo}[^\\d]{0,40}?(\\d{2}[/.-]\\d{2}[/.-]\\d{4})`,
+      `${rotulo}[^\\d]{0,100}?(\\d{2}[/.-]\\d{2}[/.-]\\d{4})`,
       'i'
     );
     const m = texto.match(regex);
@@ -267,7 +344,7 @@ function buscarData(texto, rotulos) {
   }
   return null;
 }
- 
+
 function extrairDataEmissao(texto) {
   // "Data de Emissão", "Data e Hora de Emissão", "Emitida em", "Emissão"
   return buscarData(texto, [
@@ -276,7 +353,7 @@ function extrairDataEmissao(texto) {
     'emiss[ãa]o',
   ]);
 }
- 
+
 function extrairDataVencimento(texto) {
   // "Data de Vencimento", "Vencimento", "Vence em"
   return buscarData(texto, [
@@ -285,18 +362,18 @@ function extrairDataVencimento(texto) {
     'vencimento',
   ]);
 }
- 
+
 /* ------------------------------------------------------------------ */
 /* Programa principal                                                  */
 /* ------------------------------------------------------------------ */
- 
+
 /** Nomes amigáveis de cada tipo de documento. */
 const NOMES_TIPO = {
   nota: 'Nota fiscal',
   boleto: 'Boleto',
   os: 'OS (ordem de serviço)',
 };
- 
+
 // Palavras e padrões que denunciam o tipo de cada documento.
 // Cada padrão encontrado soma um ponto para aquele tipo.
 const PADROES_TIPO = {
@@ -325,29 +402,29 @@ const PADROES_TIPO = {
     /assinatura/i,
   ],
 };
- 
+
 /**
  * Descobre se o PDF é nota, boleto ou OS. Soma pontos pelo conteúdo e
  * por dicas no nome do arquivo. Retorna 'nota', 'boleto', 'os' ou null.
  */
 function classificarDocumento(nomeArquivo, texto, escaneado) {
   const pontos = { nota: 0, boleto: 0, os: 0 };
- 
+
   for (const [tipo, padroes] of Object.entries(PADROES_TIPO)) {
     for (const padrao of padroes) {
       if (padrao.test(texto)) pontos[tipo]++;
     }
   }
- 
+
   // Dicas pelo nome do arquivo (ex.: "boleto_123.pdf", "OS 45.pdf")
   const nome = nomeArquivo.toLowerCase();
   if (/boleto/.test(nome)) pontos.boleto += 2;
   if (/nota|(?:^|[^a-z])nfs?e?(?:[^a-z]|$)/.test(nome)) pontos.nota += 2;
   if (/ordem|(?:^|[^a-z])os(?:[^a-z]|$)/.test(nome)) pontos.os += 2;
- 
+
   // Nota e boleto costumam ser PDFs digitais; a foto da folha tende a ser a OS
   if (escaneado) pontos.os += 1;
- 
+
   let melhor = null;
   let maior = 0;
   for (const [tipo, p] of Object.entries(pontos)) {
@@ -358,7 +435,7 @@ function classificarDocumento(nomeArquivo, texto, escaneado) {
   }
   return melhor;
 }
- 
+
 /**
  * Descrição do serviço na OS. Procura rótulos como "Serviço executado"
  * ou "Descrição do serviço" e captura até o próximo campo da folha.
@@ -366,53 +443,56 @@ function classificarDocumento(nomeArquivo, texto, escaneado) {
 function extrairDescricaoOS(texto) {
   // Rótulos que iniciam a descrição (do mais específico ao mais genérico)
   const inicio =
-    '(?:servi[cç]os?\\s+(?:executados?|realizados?|prestados?)|descri[cç][aã]o\\s+(?:d[oa]s?\\s+)?(?:servi[cç]os?|trabalhos?|atividades?)|atividades?\\s+realizadas?|descri[cç][aã]o)';
+    '(?:servi[cç]os?\\s+(?:executados?|realizados?|prestados?)|descri[cçg][aã]o\\s+(?:d[oa]s?\\s+)?(?:servi[cç]os?|trabalhos?|atividades?)|atividades?\\s+realizadas?|descri[cçg][aã]o)';
   // Campos comuns de uma OS que encerram a descrição (no início de uma linha)
   const fim =
     '(?:assinatura|data|cliente|t[eé]cnico|respons[aá]vel|valor|materiais?|pe[cç]as|observa[cç]|hor[aá]rio|in[ií]cio|t[eé]rmino|garantia)';
- 
+
   const regex = new RegExp(
     `${inicio}\\s*:?\\s*([\\s\\S]+?)(?=\\n\\s*${fim}|$)`,
     'i'
   );
   const m = texto.match(regex);
   if (!m) return null;
- 
+
   const descricao = resumirTexto(m[1]);
   return descricao || null;
 }
- 
+
 /** Junta quebras de linha/espaços e limita o tamanho do texto. */
 function resumirTexto(texto) {
   const t = texto.replace(/\s+/g, ' ').trim();
   return t.length > 1000 ? t.slice(0, 1000) + '…' : t;
 }
- 
+
 /**
- * Lê o texto de um PDF. Se não houver texto selecionável (foto/scan),
- * usa OCR. Retorna o texto e se foi necessário usar OCR.
+ * Lê o texto de um PDF. Se não houver texto selecionável (foto/scan) ou se
+ * o texto embutido for lixo de um OCR ruim do scanner, usa OCR.
+ * Retorna o texto e se foi necessário usar OCR.
  */
 async function lerTexto(caminho) {
   let texto = '';
+  let buffer;
   try {
-    texto = await extrairTextoPdf(fs.readFileSync(caminho));
+    buffer = fs.readFileSync(caminho);
+    texto = await extrairTextoPdf(buffer);
   } catch (erro) {
     throw new Error(`não foi possível ler o PDF (corrompido?): ${erro.message}`);
   }
- 
-  if (texto.trim().length >= 50) return { texto, escaneado: false };
- 
+
+  if (textoConfiavel(texto, buffer)) return { texto, escaneado: false };
+
   console.warn(
     `Aviso: "${path.basename(caminho)}" parece ser uma imagem. Usando OCR (pode demorar)...`
   );
   return { texto: await extrairTextoComOcr(caminho), escaneado: true };
 }
- 
+
 async function main() {
   // Arquivos informados manualmente ou, se nenhum, todos os PDFs da pasta do script
   const argumentos = process.argv.slice(2);
   let arquivos;
- 
+
   if (argumentos.length > 0) {
     arquivos = argumentos.map((a) => path.resolve(a));
   } else {
@@ -421,29 +501,29 @@ async function main() {
       .readdirSync(__dirname)
       .filter((nome) => nome.toLowerCase().endsWith('.pdf'))
       .map((nome) => path.join(__dirname, nome));
- 
+
     if (arquivos.length === 0) {
       console.error(`Nenhum PDF encontrado na pasta: ${__dirname}`);
       process.exit(1);
     }
   }
- 
+
   // Lê e classifica cada PDF: nota, boleto ou OS
   const docs = { nota: null, boleto: null, os: null };
   const avisos = [];
- 
+
   for (const arquivo of arquivos) {
     const nome = path.basename(arquivo);
- 
+
     if (!fs.existsSync(arquivo)) {
       avisos.push(`Arquivo não encontrado: ${nome}`);
       continue;
     }
- 
+
     try {
       const { texto, escaneado } = await lerTexto(arquivo);
       const tipo = classificarDocumento(nome, texto, escaneado);
- 
+
       if (!tipo) {
         avisos.push(`Não consegui identificar o tipo de "${nome}" (nota, boleto ou OS).`);
       } else if (docs[tipo]) {
@@ -457,47 +537,68 @@ async function main() {
       avisos.push(`"${nome}": ${erro.message}`);
     }
   }
- 
+
   for (const tipo of Object.keys(docs)) {
     if (!docs[tipo]) avisos.push(`Não encontrei o arquivo do tipo: ${NOMES_TIPO[tipo]}.`);
   }
- 
+
   // Campos da nota fiscal
   const textoNota = docs.nota?.texto ?? '';
-  const numeroNota = extrairNumeroNota(textoNota);
+  let numeroNota = extrairNumeroNota(textoNota);
   const dataEmissao = extrairDataEmissao(textoNota);
   const { prestador, tomador, avisos: avisosCnpj } = extrairCnpjs(textoNota);
-  const bruto = extrairValorBruto(textoNota);
+  let bruto = extrairValorBruto(textoNota);
   const liquido = extrairValorLiquido(textoNota);
   avisos.push(...avisosCnpj);
- 
+
+  // Alternativas quando a nota não entrega o campo: usa o boleto, com aviso
+  if (!numeroNota && docs.boleto) {
+    numeroNota = extrairNumeroBoleto(docs.boleto.texto);
+    if (numeroNota) {
+      avisos.push('Número da nota não encontrado na nota; usei o "Nº do documento" do boleto. Confira.');
+    }
+  }
+  if (bruto === null && docs.boleto) {
+    bruto = extrairValorBoleto(docs.boleto.texto);
+    if (bruto !== null) {
+      avisos.push('Valor bruto não encontrado na nota; usei o valor do boleto. Confira.');
+    }
+  }
+
+  // Conferência: o boleto normalmente cobra o valor líquido da nota
+  if (docs.boleto && liquido !== null) {
+    const valorBoleto = extrairValorBoleto(docs.boleto.texto);
+    if (valorBoleto !== null && Math.abs(valorBoleto - liquido) > 0.009) {
+      avisos.push(
+        `O valor do boleto (${formatarMoeda(valorBoleto)}) é diferente do valor líquido da nota (${formatarMoeda(liquido)}).`
+      );
+    }
+  }
+
   // Vencimento: vem do boleto; se não achar, tenta na nota
   const dataVencimento =
     (docs.boleto && extrairDataVencimento(docs.boleto.texto)) ||
     extrairDataVencimento(textoNota);
- 
+
   // Descrição: vem da OS; se não achar, tenta na nota
   let descricao = null;
   if (docs.os) {
     descricao = extrairDescricaoOS(docs.os.texto);
     if (!descricao) {
-      // A folha pode não ter rótulos legíveis: mostra o texto lido para conferência
-      descricao = resumirTexto(docs.os.texto) || null;
-      if (descricao) {
-        avisos.push(
-          'Não encontrei o campo de descrição na OS; mostrando o texto lido da folha. Confira.'
-        );
-      }
+      avisos.push(
+        'Não consegui ler a descrição na OS (letra manuscrita não é lida bem pelo OCR). ' +
+          'Usei a descrição da nota fiscal.'
+      );
     }
   }
   if (!descricao) descricao = extrairDescricao(textoNota);
- 
+
   // Saída
   console.log('\nArquivos identificados:');
   for (const [tipo, doc] of Object.entries(docs)) {
     console.log(`  ${NOMES_TIPO[tipo]}: ${doc ? doc.nome : NAO_ENCONTRADO}`);
   }
- 
+
   console.log('');
   console.log(`Número da nota: ${numeroNota ?? NAO_ENCONTRADO}`);
   console.log(`Data de emissão: ${dataEmissao ?? NAO_ENCONTRADO}`);
@@ -511,11 +612,28 @@ async function main() {
     `Valor líquido: ${liquido !== null ? formatarMoeda(liquido) : NAO_ENCONTRADO}`
   );
   console.log(`Descrição do serviço: ${descricao ?? NAO_ENCONTRADO}`);
- 
+
   for (const aviso of avisos) console.warn(`\nAviso: ${aviso}`);
 }
- 
-main().catch((erro) => {
-  console.error(`Erro inesperado: ${erro.message}`);
-  process.exit(1);
-});
+
+// Só executa quando chamado direto (permite importar as funções em testes)
+if (require.main === module) {
+  main().catch((erro) => {
+    console.error(`Erro inesperado: ${erro.message}`);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  textoConfiavel,
+  extrairNumeroNota,
+  extrairNumeroBoleto,
+  extrairValorBruto,
+  extrairValorLiquido,
+  extrairValorBoleto,
+  extrairDataEmissao,
+  extrairDataVencimento,
+  extrairDescricao,
+  extrairCnpjs,
+  classificarDocumento,
+};
